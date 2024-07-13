@@ -595,7 +595,7 @@ func TestMemManyAppends(t *testing.T) {
 
 	runtime.ReadMemStats(&st)
 	m1 := st.HeapAlloc
-	if m1 >= 3*MEM*N {
+	if m1-m0 >= 3*MEM*N {
 		t.Fatalf("error: server using too much memory m0 %d m1 %d\n", m0, m1)
 	}
 

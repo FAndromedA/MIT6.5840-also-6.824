@@ -49,22 +49,22 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	//recordId := getRecordId(args.ClientId, args.SeqNum)
-	recordId := recordKey{args.ClientId, args.SeqNum}
-	preReply, exist := kv.lastReply[recordId]
-	if exist {
-		reply.Value = preReply.reply
-		return
-	}
+	// recordId := recordKey{args.ClientId, args.SeqNum}
+	// preReply, exist := kv.lastReply[recordId]
+	// if exist {
+	// 	reply.Value = preReply.reply
+	// 	return
+	// }
 	value, exist := kv.kvMap[args.Key]
 	if exist {
 		reply.Value = value
 	} else {
 		reply.Value = ""
 	}
-	kv.lastReply[recordId] = entry{
-		reply:      reply.Value,
-		createTime: time.Now(),
-	}
+	// kv.lastReply[recordId] = entry{
+	// 	reply:      reply.Value,
+	// 	createTime: time.Now(),
+	// }
 }
 
 func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
@@ -73,20 +73,21 @@ func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
 	defer kv.mu.Unlock()
 	// recordId := getRecordId(args.ClientId, args.SeqNum)
 	recordId := recordKey{args.ClientId, args.SeqNum}
-	preReply, exist := kv.lastReply[recordId]
+	_, exist := kv.lastReply[recordId]
 	if exist { // we have done this record before
-		reply.Value = preReply.reply
+		//reply.Value = preReply.reply
 		return
 	}
-	value, exist := kv.kvMap[args.Key]
+	// value, exist := kv.kvMap[args.Key]
 	kv.kvMap[args.Key] = args.Value
-	if exist {
-		reply.Value = value
-	} else {
-		reply.Value = ""
-	}
+	// cause the test do not need put operation to have a reply
+	// if exist {
+	// 	reply.Value = value
+	// } else {
+	// 	reply.Value = ""
+	// }
 	kv.lastReply[recordId] = entry{
-		reply:      reply.Value,
+		//	reply:      reply.Value,
 		createTime: time.Now(),
 	}
 }

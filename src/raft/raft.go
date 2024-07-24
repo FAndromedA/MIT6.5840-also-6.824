@@ -113,6 +113,13 @@ func max(a, b int) int {
 	return b
 }
 
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -218,6 +225,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	if rf.killed() {
+		reply.VoteGranted = vDisagree
+		return
+	}
 	reply.Term = rf.currentTerm
 	if rf.currentTerm < args.Term { // 新term，votedFor重置
 		// if rf.role == leader {
@@ -237,12 +248,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// DPrintf("Candidate %d, Server %d, %d %d %d %d %v\n", args.CandidateId, rf.me, args.LastLogTerm, myLastTerm, args.LastLogIndex, len(rf.logs)-1, compLog(args.LastLogTerm, args.LastLogIndex, myLastTerm, len(rf.logs)-1))
 	}
 	if args.Term >= rf.currentTerm && compLog(args.LastLogTerm, args.LastLogIndex, myLastTerm, len(rf.logs)-1) { // 同时满足两个条件才同意
+		// if rf.role == leader { // 脑裂
+		// 	DPrintf("????C %d S %d, CT %d, ST %d", args.CandidateId, rf.me, args.Term, rf.currentTerm)
+		// }
 		reply.VoteGranted = vAgree
 		rf.votedFor = args.CandidateId
 		// 重置倒计时
 		ms := 150 + (rand.Int63() % 200)
 		rf.timer.Reset(time.Duration(ms) * time.Millisecond)
-	} else {
+	} else { // the sender is out of date
 		reply.VoteGranted = vOutOfDate
 	}
 	rf.currentTerm = max(rf.currentTerm, args.Term)
@@ -279,7 +293,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if rf.role != candidate {
+	if rf.role != candidate || rf.killed() { //must be a candidate in the following switch
 		return false
 	}
 	if ok {
@@ -293,11 +307,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 			rf.votedFor++
 			DPrintf("Server %d got a vote from %d, total %d/%d.", rf.me, server, rf.votedFor, len(rf.peers))
 			if rf.votedFor > len(rf.peers)/2 {
-				if rf.role == leader {
-					return ok
-				}
-				rf.votedFor = -1
+				// rf.votedFor = -1
+				// 如果不注释掉这一行的话，会导致同一时间选举的candidate能获得这个leader的选票（term相同，votedFor=-1）
 				rf.role = leader
+				DPrintf("<---    New Leader %d elected with Term %d    --->", rf.me, rf.currentTerm)
 				// no-op 优化
 				// no_op := LogEntry{
 				// 	Command:  0,
@@ -343,22 +356,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// }
 	if len(rf.logs)-1 < args.PreLogIndex || rf.logs[args.PreLogIndex].LogTerm != args.PreLogTerm {
 		// 继续往前找
-		reply.Success = true
+		reply.Success = false
 		return
 	}
-	var diff bool = false
-	for _, entry := range args.Entries {
+	for i, entry := range args.Entries {
 		if len(rf.logs)-1 < entry.LogIndex { //没有的日志，append
-			rf.logs = append(rf.logs, entry)
-			continue
+			rf.logs = append(rf.logs, args.Entries[i:]...)
+			break
 		}
-		if diff || rf.logs[entry.LogIndex].LogTerm != entry.LogTerm { //有但是不相同的日志，替换
-			diff = true
-			rf.logs[entry.LogIndex] = entry
-			continue
+		if rf.logs[entry.LogIndex].LogTerm != entry.LogTerm { //有但是不相同的日志，替换
+			rf.logs = rf.logs[:entry.LogIndex] // 保留 0 - entry.LogIndex-1的日志，后面的都冲突了去掉
+			// 这里不去掉的话，而是一个一个替换的话，因为旧的log数可能超过了我和当前leader同步的log数，
+			// 然而这个同步数又可能比leader的commit index小，因为我们是把小于leader commit的都提交了，所以有可能提交错误的。
+			rf.logs = append(rf.logs, args.Entries[i:]...)
+			break
 		}
 	}
-	for rf.lastApplied < args.LeaderCommit && rf.lastApplied+1 < len(rf.logs) {
+	rf.commitIndex = min(len(rf.logs)-1, args.LeaderCommit)
+	for rf.lastApplied < rf.commitIndex {
 		//if rf.logs[rf.lastApplied].Command != 0 { // commit except no-op
 		applyMsg := ApplyMsg{
 			CommandValid: true,
@@ -368,10 +383,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.applyCh <- applyMsg
 		//}
 		rf.lastApplied++
-		rf.commitIndex = rf.lastApplied
-		DPrintf("Server %d commit %d", rf.me, rf.commitIndex)
 	}
+	DPrintf("Server %d newest commit %d", rf.me, rf.commitIndex)
+	// DPrintf("Server %d LastLog %d LeaderCommit %d", rf.me, len(rf.logs)-1, args.LeaderCommit)
 	reply.Success = true
+}
+
+func (rf *Raft) leaderUpdateCommitIndex() {
+	tmpMatchIndex := make([]int, len(rf.peers))
+	copy(tmpMatchIndex, rf.matchIndex)
+	// sort.Ints(tmpMatchIndex) // this is minimum first but it should be maximum first
+	sort.Slice(tmpMatchIndex, func(i, j int) bool { return tmpMatchIndex[i] > tmpMatchIndex[j] })
+	halfPos := (len(rf.peers)+2)/2 - 1 // overhalf position, indexed from 0 so minus 1
+	// rf.commitIndex = tmpMatchIndex[halfPos] 超过一半的节点有了就commit，
+	// 因为有安全性限制，只能提交term等于当前term的日志，而且我们没用no-op优化
+	// 也是这里使得last applied 和 commit index不一样
+	if rf.logs[tmpMatchIndex[halfPos]].LogTerm == rf.currentTerm {
+		rf.commitIndex = tmpMatchIndex[halfPos]
+	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -386,19 +415,11 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	if ok {
 		if reply.Success {
 			if args.Entries != nil { // 等于nil是空心跳
-				DPrintf("Leader %d append entry to server %d, preCommitIndex %d, preLogIndex %d", rf.me, server, rf.commitIndex, args.PreLogIndex)
 				rf.nextIndex[server] = args.Entries[len(args.Entries)-1].LogIndex + 1
 				rf.matchIndex[server] = args.Entries[len(args.Entries)-1].LogIndex
-				tmpMatchIndex := make([]int, len(rf.peers))
-				copy(tmpMatchIndex, rf.matchIndex)
-				sort.Ints(tmpMatchIndex) // sort minimum first
-				halfPos := (len(rf.peers) + 2) / 2
-				// rf.commitIndex = tmpMatchIndex[halfPos] 超过一半的节点有了就commit，
-				// 因为有安全性限制，只能提交term等于当前term的日志，而且我们没用no-op优化
-				// 也是这里使得last applied 和 commit index不一样
-				if rf.logs[tmpMatchIndex[halfPos]].LogTerm == rf.currentTerm {
-					rf.commitIndex = tmpMatchIndex[halfPos]
-				}
+				// DPrintf("Leader %d TermID %d. append entry to server %d, preCommitIndex %d, preLogIndex %d, appendLen %d, newNextIndex %d",
+				//	rf.me, rf.currentTerm, server, rf.commitIndex, args.PreLogIndex, len(args.Entries), rf.nextIndex[server])
+				rf.leaderUpdateCommitIndex()
 				// 但是这里不能直接赋值，要在下面的循环里面一个一个加
 				for rf.lastApplied < rf.commitIndex {
 					//if rf.logs[rf.lastApplied].Command != 0 { // commit except no-op
@@ -411,7 +432,8 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 					rf.lastApplied++
 					//}
 				}
-				DPrintf("Leader Newest commit ID: %d.", rf.commitIndex)
+				// DPrintf("matchIndex List %v \n sorted matchIndex List %v", rf.matchIndex, tmpMatchIndex)
+				DPrintf("Leader %d Newest commit ID: %d.", rf.me, rf.commitIndex)
 			}
 		} else {
 			if reply.Term > rf.currentTerm { // rejected because term out of date
@@ -420,7 +442,8 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 				ms := 150 + (rand.Int63() % 200)
 				rf.timer.Reset(time.Duration(ms) * time.Millisecond)
 			} else if reply.Term != -1 { // rejected because it does not have preLog
-				DPrintf("Leader: %d, Consistence check: server %d nextIndex: %d, newNextIndex: %d", rf.me, server, rf.nextIndex[server], args.PreLogIndex)
+				DPrintf("Leader %d TermId %d, Consistence check: server %d nextIndex: %d, newNextIndex: %d",
+					rf.me, rf.currentTerm, server, rf.nextIndex[server], args.PreLogIndex)
 				rf.nextIndex[server] = args.PreLogIndex
 			} // reply.Term == -1 means the server is killed
 		}

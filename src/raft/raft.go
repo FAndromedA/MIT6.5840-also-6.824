@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sort"
 	"sync"
@@ -27,6 +28,7 @@ import (
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -150,6 +152,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	writer := new(bytes.Buffer)
+	e := labgob.NewEncoder(writer)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.logs)
+	raftState := writer.Bytes()
+	rf.persister.Save(raftState, nil)
 }
 
 // restore previously persisted state.
@@ -170,6 +179,19 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	receiver := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(receiver)
+	var currentTerm, votedFor int
+	var logs []LogEntry
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&logs) != nil {
+		DPrintf("Server %d failed to readPersist.", rf.me)
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.logs = logs
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -259,7 +281,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else { // the sender is out of date
 		reply.VoteGranted = vOutOfDate
 	}
-	rf.currentTerm = max(rf.currentTerm, args.Term)
+	rf.persist()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -302,6 +324,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 			rf.currentTerm = reply.Term
 			rf.votedFor = -1
 			rf.role = follower
+			rf.persist()
 			return false
 		case vAgree:
 			rf.votedFor++
@@ -310,6 +333,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 				// rf.votedFor = -1
 				// 如果不注释掉这一行的话，会导致同一时间选举的candidate能获得这个leader的选票（term相同，votedFor=-1）
 				rf.role = leader
+				rf.persist()
 				DPrintf("<---    New Leader %d elected with Term %d    --->", rf.me, rf.currentTerm)
 				// no-op 优化
 				// no_op := LogEntry{
@@ -345,8 +369,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	rf.votedFor = args.LeaderId
+	rf.votedFor = args.LeaderId // 方便 redirect to leader
 	rf.currentTerm = args.Term
+	rf.persist()
 	rf.role = follower
 	ms := 150 + (rand.Int63() % 200)
 	rf.timer.Reset(time.Duration(ms) * time.Millisecond)
@@ -372,6 +397,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			break
 		}
 	}
+	rf.persist()
 	rf.commitIndex = min(len(rf.logs)-1, args.LeaderCommit)
 	for rf.lastApplied < rf.commitIndex {
 		//if rf.logs[rf.lastApplied].Command != 0 { // commit except no-op
@@ -384,7 +410,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		//}
 		rf.lastApplied++
 	}
-	DPrintf("Server %d newest commit %d", rf.me, rf.commitIndex)
+	// DPrintf("Server %d newest commit %d", rf.me, rf.commitIndex)
 	// DPrintf("Server %d LastLog %d LeaderCommit %d", rf.me, len(rf.logs)-1, args.LeaderCommit)
 	reply.Success = true
 }
@@ -412,7 +438,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if ok {
+	if ok && rf.role == leader && !rf.killed() {
 		if reply.Success {
 			if args.Entries != nil { // 等于nil是空心跳
 				rf.nextIndex[server] = args.Entries[len(args.Entries)-1].LogIndex + 1
@@ -439,12 +465,13 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 			if reply.Term > rf.currentTerm { // rejected because term out of date
 				rf.role = follower
 				rf.currentTerm = reply.Term
+				rf.persist()
 				ms := 150 + (rand.Int63() % 200)
 				rf.timer.Reset(time.Duration(ms) * time.Millisecond)
 			} else if reply.Term != -1 { // rejected because it does not have preLog
-				DPrintf("Leader %d TermId %d, Consistence check: server %d nextIndex: %d, newNextIndex: %d",
-					rf.me, rf.currentTerm, server, rf.nextIndex[server], args.PreLogIndex)
-				rf.nextIndex[server] = args.PreLogIndex
+				DPrintf("Leader %d TermId %d, Consistence check failed: server %d, newNextIndex: %d",
+					rf.me, rf.currentTerm, server, args.PreLogIndex)
+				rf.nextIndex[server] = max(1, args.PreLogIndex/2)
 			} // reply.Term == -1 means the server is killed
 		}
 	}
@@ -482,6 +509,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	rf.matchIndex[rf.me] = len(rf.logs) // before append, so don't need minus 1
 	rf.logs = append(rf.logs, appendLog)
+	rf.persist()
 	index = len(rf.logs) - 1
 	term = rf.currentTerm
 	return index, term, isLeader
@@ -524,6 +552,7 @@ func (rf *Raft) ticker() {
 			case candidate:
 				rf.currentTerm++
 				rf.votedFor = 1 // 这里作为计数器使用
+				rf.persist()
 				DPrintf("Server %d start an election with termId: %d\n", rf.me, rf.currentTerm)
 				for i := 0; i < len(rf.peers); i++ {
 					if i == rf.me {

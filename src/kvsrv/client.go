@@ -3,6 +3,7 @@ package kvsrv
 import (
 	"crypto/rand"
 	"math/big"
+	"sync/atomic"
 
 	"6.5840/labrpc"
 )
@@ -21,14 +22,15 @@ func nrand() int64 {
 	return x
 }
 
-var totalClient int16 = 0
+var totalClient int32 = 0
 
 func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.server = server
 	ck.seqNum = nrand()
-	ck.cilentId = totalClient
-	totalClient++
+	ck.cilentId = int16(totalClient)
+	atomic.AddInt32(&totalClient, 1)
+	// totalClient++
 	// You'll have to add code here.
 	return ck
 }

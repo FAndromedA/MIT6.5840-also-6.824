@@ -955,7 +955,6 @@ func internalChurn(t *testing.T, unreliable bool) {
 	} else {
 		cfg.begin("Test (3C): churn")
 	}
-
 	stop := int32(0)
 
 	// create concurrent clients

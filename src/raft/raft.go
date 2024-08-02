@@ -21,7 +21,6 @@ import (
 	//	"bytes"
 
 	"bytes"
-	"fmt"
 	"math/rand"
 	"sort"
 	"sync"
@@ -141,10 +140,11 @@ type Raft struct {
 	electionTimeout  *time.Ticker
 	heartbeatTimeout *time.Ticker
 	applyCh          chan ApplyMsg
+	applyMu          sync.Mutex
 }
 
 func (rf *Raft) resetElection() {
-	ms := 250 + (rand.Int63() % 250)
+	ms := 250 + (rand.Int63() % 150)
 	rf.electionTimeout.Reset(time.Millisecond * time.Duration(ms))
 }
 
@@ -454,24 +454,32 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) applier() {
-	applyList := make([]ApplyMsg, 0)
-	rf.mu.Lock()
-	for rf.lastApplied < rf.commitIndex {
-		if rf.lastApplied+1-rf.startIndex <= 0 { // 有可能创建applier之后 收到来自leader的快照了，导致log被删，越界
-			rf.lastApplied++ // 之前没加这个，导致卡死
-			continue
+	rf.applyMu.Lock() // 否则下面的第一个锁释放之后lastapplied+1之前，如果进程被切换，另一个进程会重新发一次，导致lastapplied会被多加1次。从而有日志被跳过不提交
+	defer rf.applyMu.Unlock()
+	for {
+		rf.mu.Lock()
+		if rf.lastApplied < rf.commitIndex {
+			if rf.lastApplied+1-rf.startIndex <= 0 { // 有可能创建applier之后 收到来自leader的快照了，导致log被删，越界
+				rf.lastApplied++ // 之前没加这个，导致卡死
+				rf.mu.Unlock()
+				continue
+			}
+			applyMsg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.logs[rf.lastApplied+1-rf.startIndex].Command,
+				CommandIndex: rf.lastApplied + 1,
+			}
+			DPrintf("Server %d apply %d", rf.me, rf.lastApplied+1)
+			rf.mu.Unlock()
+			rf.applyCh <- applyMsg
+			rf.mu.Lock()
+			rf.lastApplied++
+			rf.mu.Unlock()
+
+		} else {
+			rf.mu.Unlock()
+			break
 		}
-		applyMsg := ApplyMsg{
-			CommandValid: true,
-			Command:      rf.logs[rf.lastApplied+1-rf.startIndex].Command,
-			CommandIndex: rf.lastApplied + 1,
-		}
-		rf.lastApplied++
-		applyList = append(applyList, applyMsg)
-	}
-	rf.mu.Unlock()
-	for _, applyMsg := range applyList {
-		rf.applyCh <- applyMsg
 	}
 }
 
@@ -500,10 +508,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 	return
 	// }
 	if args.Entries == nil || (args.Entries[0].LogIndex != emptyHeartbeatLog.LogIndex && args.Entries[0].LogTerm != emptyHeartbeatLog.LogTerm) { // not empty heart beat
-		DPrintf("%d %d %d %d", rf.me, rf.startIndex, args.PreLogIndex, len(args.Entries))
-		if len(args.Entries) > 0 {
-			DPrintf("%d %d %v", args.Entries[0].LogIndex, args.Entries[0].LogTerm, rf.startIndex+len(rf.logs)-1 < args.PreLogIndex || (args.PreLogIndex > rf.startIndex && rf.logs[args.PreLogIndex-rf.startIndex].LogTerm != args.PreLogTerm))
-		}
+		// DPrintf("%d %d %d %d", rf.me, rf.startIndex, args.PreLogIndex, len(args.Entries))
+		// if len(args.Entries) > 0 {
+		// 	DPrintf("%d %d %v", args.Entries[0].LogIndex, args.Entries[0].LogTerm, rf.startIndex+len(rf.logs)-1 < args.PreLogIndex || (args.PreLogIndex > rf.startIndex && rf.logs[args.PreLogIndex-rf.startIndex].LogTerm != args.PreLogTerm))
+		// }
 		if rf.startIndex+len(rf.logs)-1 < args.PreLogIndex ||
 			(args.PreLogIndex > rf.startIndex && rf.logs[args.PreLogIndex-rf.startIndex].LogTerm != args.PreLogTerm) {
 			// args.PreLogIndex 可能小于 rf.startIndex
@@ -517,7 +525,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				if entry.LogIndex <= rf.startIndex { // 0 不能被替换
 					continue
 				}
-				Assert(entry.LogIndex-rf.startIndex <= len(rf.logs), fmt.Sprintf("preIndex %d entry.LogIndex %d startIndex %d Len logs %d Len Entry %d %v", args.PreLogIndex, entry.LogIndex, rf.startIndex, len(rf.logs), len(args.Entries), args.Entries))
+				// Assert(entry.LogIndex-rf.startIndex <= len(rf.logs), fmt.Sprintf("preIndex %d entry.LogIndex %d startIndex %d Len logs %d Len Entry %d %v", args.PreLogIndex, entry.LogIndex, rf.startIndex, len(rf.logs), len(args.Entries), args.Entries))
 				rf.logs = rf.logs[:entry.LogIndex-rf.startIndex]
 				if rf.startIndex+len(rf.logs)-1 < entry.LogIndex { //没有的日志，append
 					rf.logs = append(rf.logs, args.Entries[i:]...)
@@ -631,16 +639,18 @@ type InstallSnapshotReply struct {
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	DPrintf("Server %d startIndex %d, receive snapshot %d", rf.me, rf.startIndex, args.LastIncludedIndex)
+	rf.applyMu.Lock() // 这里不加锁，避免lastApplied
 	rf.mu.Lock()
 	if rf.killed() {
 		reply.Term = -1
 		rf.mu.Unlock()
+		rf.applyMu.Unlock()
 		return
 	}
-
 	reply.Term = rf.currentTerm
 	if rf.currentTerm > args.Term || rf.startIndex > args.LastIncludedIndex {
 		rf.mu.Unlock()
+		rf.applyMu.Unlock()
 		return
 	}
 	rf.currentTerm = args.Term
@@ -668,14 +678,10 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		SnapshotTerm:  args.LastIncludedTerm,
 		SnapshotIndex: args.LastIncludedIndex,
 	}
+	rf.applyCh <- applyMsg
+	rf.lastApplied = args.LastIncludedIndex
 	rf.mu.Unlock()
-	go func() {
-		rf.applyCh <- applyMsg
-		rf.mu.Lock()
-		rf.lastApplied = args.LastIncludedIndex
-		rf.mu.Unlock()
-	}()
-
+	rf.applyMu.Unlock()
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
@@ -736,9 +742,23 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.persist()
 	index = appendLog.LogIndex
 	term = rf.currentTerm
-	Assert(index == rf.logs[len(rf.logs)-2].LogIndex+1, fmt.Sprintf("Leader %d Logs %v", rf.me, rf.logs))
+	go rf.Broadcast()
+	// Assert(index == rf.logs[len(rf.logs)-2].LogIndex+1, fmt.Sprintf("Leader %d Logs %v", rf.me, rf.logs))
 	DPrintf("Leader %d TermId %d, new log index %d", rf.me, rf.currentTerm, index)
 	return index, term, isLeader
+}
+
+// for the KVServer to get the private component
+func (rf *Raft) GetRole() (Role, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.role, rf.role == leader
+}
+
+func (rf *Raft) GetVotedFor() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.votedFor
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -758,6 +778,63 @@ func (rf *Raft) Kill() {
 func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
+}
+
+func (rf *Raft) Broadcast() {
+	if rf.killed() {
+		return
+	}
+	rf.mu.Lock()
+	if rf.role == leader {
+		// heartbeat
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me { // 不用发给自己
+				continue
+			}
+			if (rf.progress[i].State == pSnapshot || rf.nextIndex[i] > rf.startIndex) && (rf.matchIndex[i] < rf.startIndex+len(rf.logs)-1 || rf.snapshot == nil || rf.progress[i].PendingSnapshot >= rf.startIndex) {
+				// DPrintf("Leader %d Server %d : 1", rf.me, i)
+				preLogIndex := max(rf.nextIndex[i]-1, rf.startIndex)
+				appendArgs := AppendEntriesArgs{
+					Term:         rf.currentTerm,
+					LeaderId:     rf.me,
+					PreLogIndex:  preLogIndex, // there is no chance for nextIndex to be less than 1
+					PreLogTerm:   rf.logs[preLogIndex-rf.startIndex].LogTerm,
+					Entries:      make([]LogEntry, 1), // 心跳, 心跳不能是 nil，因为Probe状态下一开始未知next初始化为没有的log也是nil
+					LeaderCommit: rf.commitIndex,
+				}
+				appendArgs.Entries[0] = emptyHeartbeatLog
+				appendReply := AppendEntriesReply{}
+				if rf.startIndex+len(rf.logs)-1 >= rf.nextIndex[i] && rf.nextIndex[i] > rf.startIndex { // 筛掉leader没有nextIndex的日志
+					if rf.progress[i].State == pReplicate { // 定位到了match和next，一次发完
+						appendArgs.Entries = rf.logs[appendArgs.PreLogIndex+1-rf.startIndex:]
+					} else if rf.progress[i].State == pProbe { // 没定位到 match和next，一次只发一条
+						// appendArgs.Entries[0] = rf.logs[appendArgs.PreLogIndex+1-rf.startIndex] 调试不好，还是一次发所有吧
+						appendArgs.Entries = rf.logs[appendArgs.PreLogIndex+1-rf.startIndex:]
+					} // 如果是pSnapshot不发entries，只发心跳
+				} else if rf.progress[i].State != pSnapshot && rf.nextIndex[i] > rf.startIndex { //没有nextIndex的日志,也有可能是nil
+					appendArgs.Entries = nil
+				}
+
+				go rf.sendAppendEntries(i, &appendArgs, &appendReply)
+			} else if (rf.snapshot != nil && rf.progress[i].PendingSnapshot < rf.startIndex) && (rf.nextIndex[i] <= rf.startIndex ||
+				rf.matchIndex[i] == rf.startIndex+len(rf.logs)-1) {
+				// DPrintf("Leader %d Server %d : 2", rf.me, i)
+				snapshotArgs := InstallSnapshotArgs{
+					Term:              rf.currentTerm,
+					LeaderId:          rf.me,
+					LastIncludedIndex: rf.startIndex,
+					LastIncludedTerm:  rf.LastIncludedTerm,
+					Data:              rf.snapshot,
+				}
+				snapshotReply := InstallSnapshotReply{}
+				rf.progress[i].State = pSnapshot
+				// rf.progress[i].PendingSnapshot = rf.startIndex
+				go rf.sendInstallSnapshot(i, &snapshotArgs, &snapshotReply)
+			}
+
+		}
+	}
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) ticker() {
@@ -797,61 +874,10 @@ func (rf *Raft) ticker() {
 			}
 			rf.mu.Unlock()
 		case <-rf.heartbeatTimeout.C:
-			if rf.killed() {
-				break
-			}
-			rf.mu.Lock()
 			if rf.role == leader {
-				// heartbeat
 				rf.resetHeartbeat()
-				for i := 0; i < len(rf.peers); i++ {
-					if i == rf.me { // 不用发给自己
-						continue
-					}
-					if (rf.progress[i].State == pSnapshot || rf.nextIndex[i] > rf.startIndex) && (rf.matchIndex[i] < rf.startIndex+len(rf.logs)-1 || rf.snapshot == nil || rf.progress[i].PendingSnapshot >= rf.startIndex) {
-						// DPrintf("Leader %d Server %d : 1", rf.me, i)
-						preLogIndex := max(rf.nextIndex[i]-1, rf.startIndex)
-						appendArgs := AppendEntriesArgs{
-							Term:         rf.currentTerm,
-							LeaderId:     rf.me,
-							PreLogIndex:  preLogIndex, // there is no chance for nextIndex to be less than 1
-							PreLogTerm:   rf.logs[preLogIndex-rf.startIndex].LogTerm,
-							Entries:      make([]LogEntry, 1), // 心跳, 心跳不能是 nil，因为Probe状态下一开始未知next初始化为没有的log也是nil
-							LeaderCommit: rf.commitIndex,
-						}
-						appendArgs.Entries[0] = emptyHeartbeatLog
-						appendReply := AppendEntriesReply{}
-						if rf.startIndex+len(rf.logs)-1 >= rf.nextIndex[i] && rf.nextIndex[i] > rf.startIndex { // 筛掉leader没有nextIndex的日志
-							if rf.progress[i].State == pReplicate { // 定位到了match和next，一次发完
-								appendArgs.Entries = rf.logs[appendArgs.PreLogIndex+1-rf.startIndex:]
-							} else if rf.progress[i].State == pProbe { // 没定位到 match和next，一次只发一条
-								// appendArgs.Entries[0] = rf.logs[appendArgs.PreLogIndex+1-rf.startIndex] 调试不好，还是一次发所有吧
-								appendArgs.Entries = rf.logs[appendArgs.PreLogIndex+1-rf.startIndex:]
-							} // 如果是pSnapshot不发entries，只发心跳
-						} else if rf.progress[i].State != pSnapshot && rf.nextIndex[i] > rf.startIndex { //没有nextIndex的日志,也有可能是nil
-							appendArgs.Entries = nil
-						}
-
-						go rf.sendAppendEntries(i, &appendArgs, &appendReply)
-					} else if (rf.snapshot != nil && rf.progress[i].PendingSnapshot < rf.startIndex) && (rf.nextIndex[i] <= rf.startIndex ||
-						rf.matchIndex[i] == rf.startIndex+len(rf.logs)-1) {
-						// DPrintf("Leader %d Server %d : 2", rf.me, i)
-						snapshotArgs := InstallSnapshotArgs{
-							Term:              rf.currentTerm,
-							LeaderId:          rf.me,
-							LastIncludedIndex: rf.startIndex,
-							LastIncludedTerm:  rf.LastIncludedTerm,
-							Data:              rf.snapshot,
-						}
-						snapshotReply := InstallSnapshotReply{}
-						rf.progress[i].State = pSnapshot
-						// rf.progress[i].PendingSnapshot = rf.startIndex
-						go rf.sendInstallSnapshot(i, &snapshotArgs, &snapshotReply)
-					}
-
-				}
+				rf.Broadcast()
 			}
-			rf.mu.Unlock()
 		}
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.

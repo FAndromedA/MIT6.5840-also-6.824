@@ -126,6 +126,7 @@ func (kv *KVServer) handleMsgFromRaft() {
 				}
 				kvPrintf("))))) %d, %d, %s, %s, %d", opt.CLientId, opt.OpType, opt.Key, opt.Value, opt.SeqNum)
 				if !exists1 { // 不存在的直接continue，不然没有接收方，后面发送会卡死
+					// 并且必须在后面continue，因为先要根据日志恢复kvmap
 					kv.mu.Unlock()
 					continue
 				}

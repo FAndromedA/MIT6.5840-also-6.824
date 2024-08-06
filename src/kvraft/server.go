@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"sync"
@@ -50,8 +51,8 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	kvMap   map[string]string
-	lastAck map[int32]int64
+	kvMap   map[string]string // snapshot
+	lastAck map[int32]int64   // snapshot
 	waitCh  map[int]chan Op
 	// clientChannel
 }
@@ -78,6 +79,22 @@ func (kv *KVServer) updateLastAck(lastAck int64, exists bool, opt *Op) {
 		kv.lastAck[int32(opt.CLientId)] = lastAck
 	}
 
+}
+
+func (kv *KVServer) readPersist(snapshot []byte) {
+	writer := bytes.NewBuffer(snapshot)
+	decoder := labgob.NewDecoder(writer)
+	kvmap := make(map[string]string)
+	lastack := make(map[int32]int64)
+	if decoder.Decode(&kvmap) != nil || decoder.Decode(&lastack) != nil {
+		kvPrintf("WARNING: KVServer %d failed to load snapshot form leader.", kv.me)
+	} else {
+		kvPrintf("kvServer %d receive snapshot", kv.me)
+		kv.mu.Lock()
+		kv.kvMap = kvmap
+		kv.lastAck = lastack
+		kv.mu.Unlock()
+	}
 }
 
 func (kv *KVServer) handleMsgFromRaft() {
@@ -119,6 +136,15 @@ func (kv *KVServer) handleMsgFromRaft() {
 					}
 					kvPrintf("----- client: %d,type: %d,\n key: %s,value: %s, preValue: %s,\n seq: %d", opt.CLientId, opt.OpType, opt.Key, kv.kvMap[opt.Key], opt.Value, opt.SeqNum)
 				}
+				if kv.maxraftstate != -1 && kv.rf.Persister.RaftStateSize() > kv.maxraftstate {
+					// raft state超过限额，自动保存快照
+					kvPrintf("kvServer %d self save", kv.me)
+					writer := new(bytes.Buffer)
+					encoder := labgob.NewEncoder(writer)
+					encoder.Encode(kv.kvMap)
+					encoder.Encode(kv.lastAck)
+					kv.rf.Snapshot(index, writer.Bytes())
+				}
 				//kvPrintf("))))) %d, %d, %s, %s, %d", opt.CLientId, opt.OpType, opt.Key, opt.Value, opt.SeqNum)
 				waitChan, exists1 := kv.waitCh[index]
 				if !exists1 { // 不存在的直接continue，不然没有接收方，后面发送会卡死
@@ -129,6 +155,7 @@ func (kv *KVServer) handleMsgFromRaft() {
 				kv.mu.Unlock()
 				waitChan <- opt
 			} else if rfMsg.SnapshotValid {
+				kv.readPersist(rfMsg.Snapshot)
 				continue
 			}
 		}
@@ -312,6 +339,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.kvMap = make(map[string]string)
 	kv.lastAck = make(map[int32]int64)
 	kv.waitCh = make(map[int]chan Op)
+
+	kv.readPersist(persister.ReadSnapshot())
 	// You may need initialization code here.
 	go kv.handleMsgFromRaft()
 	return kv

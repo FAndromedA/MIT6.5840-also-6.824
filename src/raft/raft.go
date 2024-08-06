@@ -105,7 +105,7 @@ type Progress struct {
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
+	Persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 	dead      int32               // set by Kill()
 
@@ -205,9 +205,9 @@ func (rf *Raft) persist() {
 	e.Encode(rf.logs)
 	raftState := writer.Bytes()
 	if len(rf.snapshot) == 0 {
-		rf.persister.Save(raftState, nil)
+		rf.Persister.Save(raftState, nil)
 	} else {
-		rf.persister.Save(raftState, rf.snapshot) //只在installSnapshot里面的persist直接调用
+		rf.Persister.Save(raftState, rf.snapshot) //只在installSnapshot里面的persist直接调用
 	}
 
 }
@@ -246,7 +246,7 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.votedFor = votedFor
 		rf.startIndex = startIndex
 		rf.LastIncludedTerm = LastIncludedTerm
-		rf.snapshot = rf.persister.ReadSnapshot()
+		rf.snapshot = rf.Persister.ReadSnapshot()
 		rf.logs = logs
 		rf.logs[0].LogIndex = startIndex
 		rf.logs[0].LogTerm = LastIncludedTerm
@@ -925,7 +925,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
 	rf.peers = peers
-	rf.persister = persister
+	rf.Persister = persister
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).

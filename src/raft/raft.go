@@ -144,7 +144,7 @@ type Raft struct {
 }
 
 func (rf *Raft) resetElection() {
-	ms := 250 + (rand.Int63() % 150)
+	ms := 200 + (rand.Int63() % 200)
 	rf.electionTimeout.Reset(time.Millisecond * time.Duration(ms))
 }
 
@@ -283,11 +283,13 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	if rf.killed() {
 		return
 	}
-	DPrintf("%d %d ____________________________________", rf.me, index)
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if rf.startIndex >= index || index > rf.commitIndex {
+		// 蠢死了这里一开始没加Unlock
 		return
 	}
+	DPrintf("%d %d ____________________________________", rf.me, index)
 	if len(snapshot) > 0 {
 
 		rf.logs = rf.logs[index-rf.startIndex:] // 保留最后一个作为logs[0]占位符
@@ -297,7 +299,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		rf.persist()
 		// rf.persister.Save(rf.persister.ReadRaftState(), snapshot)
 	}
-	rf.mu.Unlock()
+
 	DPrintf("%d ++++++++++++++++++++++++++++++++++++", rf.me)
 }
 
@@ -456,7 +458,7 @@ type AppendEntriesReply struct {
 func (rf *Raft) applier() {
 	rf.applyMu.Lock() // 否则下面的第一个锁释放之后lastapplied+1之前，如果进程被切换，另一个进程会重新发一次，导致lastapplied会被多加1次。从而有日志被跳过不提交
 	defer rf.applyMu.Unlock()
-	for {
+	for !rf.killed() {
 		rf.mu.Lock()
 		if rf.lastApplied < rf.commitIndex {
 			if rf.lastApplied+1-rf.startIndex <= 0 { // 有可能创建applier之后 收到来自leader的快照了，导致log被删，越界
@@ -470,8 +472,10 @@ func (rf *Raft) applier() {
 				CommandIndex: rf.lastApplied + 1,
 			}
 			DPrintf("Server %d apply %d", rf.me, rf.lastApplied+1)
+
 			rf.mu.Unlock()
 			rf.applyCh <- applyMsg
+			// atomic.AddInt32(&rf.lastApplied, 1)
 			rf.mu.Lock()
 			rf.lastApplied++
 			rf.mu.Unlock()
@@ -497,7 +501,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-
+	reply.Success = true
 	rf.votedFor = args.LeaderId // 方便 redirect to leader
 	rf.currentTerm = args.Term
 	rf.persist()
@@ -519,14 +523,28 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Success = false
 			return
 		}
+		if len(args.Entries) > 0 && !compLog(args.Entries[len(args.Entries)-1].LogTerm, args.Entries[len(args.Entries)-1].LogIndex, rf.logs[len(rf.logs)-1].LogTerm, rf.logs[len(rf.logs)-1].LogIndex) {
+			// 如果是leader先前发的过时rpc也不接受，避免丢失已有的日志，而leader刚好提交了，然后拥有备份数不过半，然后此时如果重新选举可能导致提交日志丢失。
+			// 过时rpc
+			// 因为我们有 no-op优化，所以可以这样写，如果没有的话，就只能
+			DPrintf("outof date rpc")
+			reply.Term = -1
+			return // success = True 且 Term = -1 就是过时 rpc
+		}
 		if args.Entries != nil {
-
+			// 已经排除了过时rpc的情况,直接截断后面的日志
+			DPrintf("args' term1 %d index1 %d , mine term2 %d index2 %d", args.Entries[len(args.Entries)-1].LogTerm, args.Entries[len(args.Entries)-1].LogIndex, rf.logs[len(rf.logs)-1].LogTerm, rf.logs[len(rf.logs)-1].LogIndex)
+			First := true
 			for i, entry := range args.Entries {
 				if entry.LogIndex <= rf.startIndex { // 0 不能被替换
 					continue
 				}
+				if First {
+					rf.logs = rf.logs[:min(len(rf.logs), args.Entries[len(args.Entries)-1].LogIndex+1-rf.startIndex)]
+					First = false
+				}
 				// Assert(entry.LogIndex-rf.startIndex <= len(rf.logs), fmt.Sprintf("preIndex %d entry.LogIndex %d startIndex %d Len logs %d Len Entry %d %v", args.PreLogIndex, entry.LogIndex, rf.startIndex, len(rf.logs), len(args.Entries), args.Entries))
-				rf.logs = rf.logs[:entry.LogIndex-rf.startIndex]
+
 				if rf.startIndex+len(rf.logs)-1 < entry.LogIndex { //没有的日志，append
 					rf.logs = append(rf.logs, args.Entries[i:]...)
 					break
@@ -538,7 +556,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					rf.logs = append(rf.logs, args.Entries[i:]...)
 					break
 				}
-				rf.logs = append(rf.logs, entry)
+				//rf.logs = append(rf.logs, entry)
 			}
 		}
 		rf.persist()
@@ -546,10 +564,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		go rf.applier()
 	}
 	DPrintf("Server %d LastLog %d LeaderCommit %d serverCommit %d", rf.me, rf.startIndex+len(rf.logs)-1, args.LeaderCommit, rf.commitIndex)
-	reply.Success = true
 }
 
-func (rf *Raft) leaderUpdateCommitIndex() {
+func (rf *Raft) leaderUpdateCommitIndex() bool {
 	tmpMatchIndex := make([]int, len(rf.peers))
 	copy(tmpMatchIndex, rf.matchIndex)
 	// sort.Ints(tmpMatchIndex) // this is minimum first but it should be maximum first
@@ -558,10 +575,12 @@ func (rf *Raft) leaderUpdateCommitIndex() {
 	// rf.commitIndex = tmpMatchIndex[halfPos] 超过一半的节点有了就commit，
 	// 因为有安全性限制，只能提交term等于当前term的日志，而且我们没用no-op优化
 	// 也是这里使得last applied 和 commit index不一样
+	preCommitIndex := rf.commitIndex
 	if tmpMatchIndex[halfPos] > rf.startIndex && rf.logs[tmpMatchIndex[halfPos]-rf.startIndex].LogTerm == rf.currentTerm {
 		rf.commitIndex = tmpMatchIndex[halfPos]
 	}
-	DPrintf("Leader %d TermId %d commit %d, matchIndex List %v \n sorted matchIndex List %v", rf.me, rf.currentTerm, rf.commitIndex, rf.matchIndex, tmpMatchIndex)
+	DPrintf("Leader %d TermId %d precommit %d commit %d, matchIndex List %v \n sorted matchIndex List %v", rf.me, rf.currentTerm, preCommitIndex, rf.commitIndex, rf.matchIndex, tmpMatchIndex)
+	return preCommitIndex != rf.commitIndex
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -577,21 +596,24 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 		if reply.Success {
 			if args.Entries == nil || (args.Entries[0].LogIndex != emptyHeartbeatLog.LogIndex && args.Entries[0].LogTerm != emptyHeartbeatLog.LogTerm) { // not empty heart beat
 				rf.progress[server].State = pReplicate
-				if args.Entries != nil {
-					rf.nextIndex[server] = args.Entries[len(args.Entries)-1].LogIndex + 1 //我们一定会发送leader的最后一个log// //rf.matchIndex[rf.me] + 1
-					rf.matchIndex[server] = args.Entries[len(args.Entries)-1].LogIndex    //    //rf.matchIndex[rf.me]
-				} else { // 发送的是 nil，即发送的nextIndex超过了leader的logs，preIndex是logs的最后一项
-					rf.nextIndex[server] = args.PreLogIndex + 1
-					rf.matchIndex[server] = args.PreLogIndex
+				if reply.Term != -1 { // 前提 rpc 没有过时，才更新，详细见readme 4A debug
+					if args.Entries != nil {
+						rf.nextIndex[server] = args.Entries[len(args.Entries)-1].LogIndex + 1 //我们一定会发送leader的最后一个log// //rf.matchIndex[rf.me] + 1
+						rf.matchIndex[server] = args.Entries[len(args.Entries)-1].LogIndex    //    //rf.matchIndex[rf.me]
+					} else { // 发送的是 nil，即发送的nextIndex超过了leader的logs，preIndex是logs的最后一项
+						rf.nextIndex[server] = args.PreLogIndex + 1
+						rf.matchIndex[server] = args.PreLogIndex
+					}
 				}
 
 				// DPrintf("Leader %d TermID %d. append entry to server %d, preCommitIndex %d, preLogIndex %d, appendLen %d, newNextIndex %d",
 				//	rf.me, rf.currentTerm, server, rf.commitIndex, args.PreLogIndex, len(args.Entries), rf.nextIndex[server])
-				rf.leaderUpdateCommitIndex()
-				go rf.applier()
+				if rf.leaderUpdateCommitIndex() {
+					go rf.applier()
+				}
 			}
-			DPrintf("Server %d Len %d not Empty %v preLogIndex %d startIndex %d", server, len(args.Entries), args.Entries == nil || (args.Entries[0].LogIndex != emptyHeartbeatLog.LogIndex && args.Entries[0].LogTerm != emptyHeartbeatLog.LogTerm),
-				args.PreLogIndex, rf.startIndex)
+			//DPrintf("Server %d Len %d not Empty %v preLogIndex %d startIndex %d", server, len(args.Entries), args.Entries == nil || (args.Entries[0].LogIndex != emptyHeartbeatLog.LogIndex && args.Entries[0].LogTerm != emptyHeartbeatLog.LogTerm),
+			//	args.PreLogIndex, rf.startIndex)
 			//DPrintf("Leader %d Newest commit ID: %d.", rf.me, rf.commitIndex)
 			//}
 		} else {
@@ -638,19 +660,21 @@ type InstallSnapshotReply struct {
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
-	DPrintf("Server %d startIndex %d, receive snapshot %d", rf.me, rf.startIndex, args.LastIncludedIndex)
+
 	rf.applyMu.Lock() // 这里不加锁，避免lastApplied
+	defer rf.applyMu.Unlock()
 	rf.mu.Lock()
 	if rf.killed() {
 		reply.Term = -1
 		rf.mu.Unlock()
-		rf.applyMu.Unlock()
+		//rf.applyMu.Unlock()
 		return
 	}
+	// DPrintf("Server %d startIndex %d, receive snapshot %d", rf.me, rf.startIndex, args.LastIncludedIndex)
 	reply.Term = rf.currentTerm
 	if rf.currentTerm > args.Term || rf.startIndex > args.LastIncludedIndex {
 		rf.mu.Unlock()
-		rf.applyMu.Unlock()
+		//rf.applyMu.Unlock()
 		return
 	}
 	rf.currentTerm = args.Term
@@ -678,10 +702,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		SnapshotTerm:  args.LastIncludedTerm,
 		SnapshotIndex: args.LastIncludedIndex,
 	}
+	rf.mu.Unlock()
 	rf.applyCh <- applyMsg
+	rf.mu.Lock()
 	rf.lastApplied = args.LastIncludedIndex
 	rf.mu.Unlock()
-	rf.applyMu.Unlock()
+	//rf.applyMu.Unlock()
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
@@ -785,6 +811,7 @@ func (rf *Raft) Broadcast() {
 		return
 	}
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if rf.role == leader {
 		// heartbeat
 		for i := 0; i < len(rf.peers); i++ {
@@ -834,7 +861,6 @@ func (rf *Raft) Broadcast() {
 
 		}
 	}
-	rf.mu.Unlock()
 }
 
 func (rf *Raft) ticker() {
@@ -921,7 +947,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	// start ticker goroutine to start elections
-	DPrintf("Server %d initialization done.\n", me)
 	DPrintf("Server %d initialization done.\n", me)
 	go rf.ticker()
 

@@ -58,8 +58,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
-	// ck.seqNum++
-	atomic.AddInt64(&ck.seqNum, 1)
+	ck.seqNum++
+	// atomic.AddInt64(&ck.seqNum, 1)
 	args := GetArgs{
 		Key:      key,
 		ClientId: ck.clientId,
@@ -73,7 +73,7 @@ func (ck *Clerk) Get(key string) string {
 		ok := ck.servers[serverId].Call(rpcFunc, &args, &reply)
 		if ok {
 			var errno int
-			//kvPrintf("%d Get %v", serverId, string(reply.Err))
+			kvPrintf("ERRINFO: client %d, server:%d , seq %d, Get %v", ck.clientId, serverId, args.SeqNum, reply.Err)
 			fmt.Sscanf(string(reply.Err), "Error %d:", &errno)
 			switch errno {
 			case 0: // no error
@@ -84,6 +84,8 @@ func (ck *Clerk) Get(key string) string {
 				// 	ck.lastAck.reply = reply
 				// }
 				return reply.Value
+			case 3: // timeout 不用切换，否则时延会很高，导致某些测试错误
+				//time.Sleep(time.Duration(250) * time.Millisecond)
 			case 2: // the KVServer is not the leader
 				var newLeaderId int
 				fmt.Sscanf(string(reply.Err), "Error 2: Not Current Leader, try %d instead.", &newLeaderId)
@@ -93,8 +95,6 @@ func (ck *Clerk) Get(key string) string {
 				// }
 				fallthrough
 			// case 1: // the KVServer is killed
-			// 	fallthrough
-			// case 3: // timeout
 			// 	fallthrough
 			default:
 				serverId = (serverId + 1) % len(ck.servers)
@@ -121,8 +121,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	} else if op == "Append" {
 		rpcFunc = "KVServer.Append"
 	}
-	atomic.AddInt64(&ck.seqNum, 1)
-	// ck.seqNum++
+	// atomic.AddInt64(&ck.seqNum, 1)
+	ck.seqNum++
 	args := PutAppendArgs{
 		Key:      key,
 		Value:    value,
@@ -137,7 +137,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		ok := ck.servers[serverId].Call(rpcFunc, &args, &reply)
 		if ok {
 			var errno int
-			kvPrintf("server:%d , seq %d, PutAppend %v", serverId, args.SeqNum, reply.Err)
+			kvPrintf("ERRINFO: client %d, server:%d , seq %d, PutAppend %v", ck.clientId, serverId, args.SeqNum, reply.Err)
 			fmt.Sscanf(string(reply.Err), "Error %d:", &errno)
 			switch errno {
 			case 0: // no error
@@ -147,6 +147,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				// 	ck.lastAck.reply = GetReply{}
 				// }
 				return
+			case 3: // timeout 不用切换，否则时延会很高，导致某些测试错误
+				//time.Sleep(time.Duration(50) * time.Millisecond)
 			case 2: // the KVServer is not the leader
 				var newLeaderId int
 				fmt.Sscanf(string(reply.Err), "Error 2: Not Current Leader, try %d instead.", &newLeaderId)

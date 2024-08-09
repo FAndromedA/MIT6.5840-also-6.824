@@ -195,7 +195,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	select {
 	case opt := <-waitChan:
 		if opt.CLientId != args.ClientId || opt.SeqNum != args.SeqNum { // 虽然等到了且index刚好相同，但是我提交的log被覆盖掉了
-			// 譬如同步的是leader发过来的日志，刚好index相同
+			// 譬如同步的是leader发过来的日志，刚好index相同；我提交的log被覆盖掉了说明我现在很可能不是leader了
 			reply.Err = Err(fmt.Sprintf("Error 2: Not Current Leader, try %d instead.", kv.rf.GetVotedFor()))
 			return
 		}

@@ -300,9 +300,9 @@ func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
 // about this, but it may be convenient (for example)
 // to suppress debug output from a Kill()ed instance.
 func (kv *KVServer) Kill() {
-	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
+	atomic.StoreInt32(&kv.dead, 1)
 }
 
 func (kv *KVServer) killed() bool {

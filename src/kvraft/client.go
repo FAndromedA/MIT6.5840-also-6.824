@@ -133,7 +133,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	serverId := ck.leaderId
 	for {
 		reply := PutAppendReply{} // 必须每个循环重新定义
-		args.ServerId = serverId
+		// args.ServerId = serverId
 		ok := ck.servers[serverId].Call(rpcFunc, &args, &reply)
 		if ok {
 			var errno int

@@ -3,6 +3,7 @@ package shardctrler
 import (
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"6.5840/labgob"
@@ -21,6 +22,7 @@ type ShardCtrler struct {
 	configs  []Config // indexed by config num
 	lastAck  map[int64]int64
 	waitChan map[int]chan Op
+	dead     int32 // set by Kill()
 }
 
 const timeoutLimit = time.Duration(100) * time.Millisecond
@@ -176,6 +178,9 @@ func (sc *ShardCtrler) deepCopyConfig(previousOne *Config) Config {
 
 func (sc *ShardCtrler) handleMsgFromRaft() {
 	for {
+		if sc.killed() {
+			return
+		}
 		select {
 		case rfMsg := <-sc.applyCh:
 			if rfMsg.CommandValid {
@@ -245,6 +250,10 @@ The shardctrler should allow re-use of a GID if it's not part of the current con
 */
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
+	if sc.killed() {
+		reply.WrongLeader = true
+		return
+	}
 	if sc.duplicateSeq(args.ClientId, args.SeqNum) {
 		reply.WrongLeader = false
 		reply.Err = Duplicate
@@ -286,6 +295,10 @@ and should move as few shards as possible to achieve that goal.
 */
 func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	// Your code here.
+	if sc.killed() {
+		reply.WrongLeader = true
+		return
+	}
 	if sc.duplicateSeq(args.ClientId, args.SeqNum) {
 		reply.WrongLeader = false
 		reply.Err = Duplicate
@@ -328,6 +341,10 @@ a Move will likely un-do the Move, since Join and Leave re-balance.
 */
 func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 	// Your code here.
+	if sc.killed() {
+		reply.WrongLeader = true
+		return
+	}
 	if sc.duplicateSeq(args.ClientId, args.SeqNum) {
 		reply.WrongLeader = false
 		reply.Err = Duplicate
@@ -371,6 +388,10 @@ or Move RPC that the shardctrler finished handling before it received the Query(
 */
 func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	// Your code here.
+	if sc.killed() {
+		reply.WrongLeader = true
+		return
+	}
 	op := Op{OpType: opQuery, ClientId: args.ClientId, SeqNum: args.SeqNum, GIDorNum: args.Num}
 	index, _, isLeader := sc.rf.Start(op)
 	if !isLeader {
@@ -407,6 +428,12 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 func (sc *ShardCtrler) Kill() {
 	sc.rf.Kill()
 	// Your code here, if desired.
+	atomic.StoreInt32(&sc.dead, 1)
+}
+
+func (sc *ShardCtrler) killed() bool {
+	z := atomic.LoadInt32(&sc.dead)
+	return z == 1
 }
 
 // needed by shardkv tester

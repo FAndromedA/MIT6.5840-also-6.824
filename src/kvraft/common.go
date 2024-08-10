@@ -17,7 +17,7 @@ type PutAppendArgs struct {
 	// otherwise RPC will break.
 	ClientId int32
 	SeqNum   int64
-	ServerId int
+	// ServerId int
 	// LastAck  LastReply
 }
 
